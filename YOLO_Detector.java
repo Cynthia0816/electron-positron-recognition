@@ -22,9 +22,14 @@ import java.awt.Graphics2D;
 import org.apache.commons.math3.fitting.PolynomialCurveFitter;
 import org.apache.commons.math3.fitting.WeightedObservedPoint;
 import org.apache.commons.math3.analysis.polynomials.PolynomialFunction;
+import ij.gui.Plot;
 
 /**
- * Helper class to store information about a single object detection.
+ * Helper class to store information about a single object detection. Stores three attributes per "detection"
+ * classID is useful so we can determine which detection is for which class. This is dependent on how the classes
+ * are ordered in the original YOLO model, be sure to check this.
+ * confidence is useful to determine which detection is most confident.
+ * box stores an array of the xyxy positions of the box that yolo outputs.
  */
 class Detection {
     int classId;
@@ -38,13 +43,26 @@ class Detection {
     }
 }
 
+/*
+ * J-COMMENT: This is the main class for our plugin.
+ * 'implements PlugInFilter' tells ImageJ that this class is a standard plugin
+ * that can be run on an image. It requires us to provide the 'setup' and 'run' methods.
+ */
 public class YOLO_Detector implements PlugInFilter {
+    // J-COMMENT: 'private' variables are only accessible within this YOLO_Detector class.
     private ImagePlus image;
     private static OrtEnvironment env;
     private static OrtSession session;
+
+    // J-COMMENT: 'final' means this variable is a constant and cannot be changed after it's set.
     private final int MODEL_WIDTH = 1024;
     private final int MODEL_HEIGHT = 1024;
 
+    /*
+     * J-COMMENT: '@Override' is an annotation that tells the compiler we are intentionally
+     * replacing a method from the 'PlugInFilter' interface. This helps catch typos.
+     * This 'setup' method is called by ImageJ once when the plugin starts.
+     */
     @Override
     public int setup(String arg, ImagePlus imp) {
         if (imp == null) {
@@ -57,7 +75,7 @@ public class YOLO_Detector implements PlugInFilter {
                 env = OrtEnvironment.getEnvironment();
                 // --- IMPORTANT: UPDATE THIS PATH ---
                 String modelPath = "C:/Users/admin/Downloads/ij154-win-java8/ImageJ/plugins/best.onnx";
-                session = env.createSession(modelPath, new OrtSession.SessionOptions());
+                session = env.createSession(modelPath, new OrtSession.SessionOptions()); // some ONNX functionality that loads our onnx file so we can feed it in images
                 IJ.log("ONNX model loaded successfully.");
             } catch (OrtException e) {
                 IJ.handleException(e);
@@ -73,22 +91,28 @@ public class YOLO_Detector implements PlugInFilter {
             // == 1. PRE-PROCESSING AND INFERENCE ==
             int originalWidth = ip.getWidth();
             int originalHeight = ip.getHeight();
-            float[] inputData = preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT);
-            OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH});
+            float[] inputData = preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT); //run data through preprocessing function that gets the data into a format yolo model can correctly read
+            OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH}); //ONNX method that takes in our image data (formatted as an array of floats) and converts it into a tensor object that yolo can take as input
             String inputName = session.getInputNames().iterator().next();
             OrtSession.Result results = session.run(Collections.singletonMap(inputName, inputTensor));
-            float[][][] outputData = (float[][][]) results.get(0).getValue();
-            float[][] transposedData = transpose(outputData[0]);
+            float[][][] outputData = (float[][][]) results.get(0).getValue(); // yolo model outputs a 4d array, we're only interested in the first component (.get(0)), leaving us with a 3d array
+            float[][] transposedData = transpose(outputData[0]); // our 3d array still has a batch dimension (looks like (1, x, y)), so we do data[0] to get rid of the batch dimension. then we transpose so the rows represent detections
 
             // == 2. FILTER DETECTIONS TO GET BEST FOR EACH CLASS ==
             Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();
+            /*
+             * J-COMMENT: 'Map<Integer, Detection>' is a dictionary-like data structure.
+             * It maps a key (the class ID, an 'Integer') to a value (the 'Detection' object).
+             * 'new HashMap<>()' creates a new, empty map.
+             */
+
             float confidenceThreshold = 0.25f;
-            for (float[] detectionData : transposedData) {
+            for (float[] detectionData : transposedData) { //assumes that transposedData is composed of an array of arrays, where each row stores info about a single detection. We iterate over every row to iterate over all detections
                 float[] classScores = new float[detectionData.length - 4];
                 System.arraycopy(detectionData, 4, classScores, 0, classScores.length);
                 int bestClassId = -1;
                 float maxScore = 0.0f;
-                for (int i = 0; i < classScores.length; i++) {
+                for (int i = 0; i < classScores.length; i++) { 
                     if (classScores[i] > maxScore) {
                         maxScore = classScores[i];
                         bestClassId = i;
@@ -105,12 +129,16 @@ public class YOLO_Detector implements PlugInFilter {
 
             // == 3. CREATE SIGNAL AND BACKGROUND ROIs ==
             String[] classNames = {"electron", "positron"};
-            List<Roi> signalRois = new ArrayList<>();
-            List<Roi> backgroundRois = new ArrayList<>();
+            List<Roi> signalRois = new ArrayList<>(); //empty list to store detected rois
+            List<Roi> analysisRois = new ArrayList<>(); // empty list to store rois for analysis (we add 2 pixels of padding on each side for interpolation)
 
-            for (Detection detection : bestDetectionsPerClass.values()) {
-                float scale = Math.min((float) MODEL_WIDTH / originalWidth, (float) MODEL_HEIGHT / originalHeight);
-                int padX = (MODEL_WIDTH - Math.round(originalWidth * scale)) / 2;
+            // Use a sorted list to ensure consistent ordering (e.g., electron then positron), sorting by class ID.
+            List<Detection> sortedDetections = new ArrayList<>(bestDetectionsPerClass.values());
+            Collections.sort(sortedDetections, (d1, d2) -> Integer.compare(d1.classId, d2.classId));
+
+            for (Detection detection : sortedDetections) {
+                float scale = Math.min((float) MODEL_WIDTH / originalWidth, (float) MODEL_HEIGHT / originalHeight); //scale is used to rescale xy positions from the output of the yolo model to positions on imagej image
+                int padX = (MODEL_WIDTH - Math.round(originalWidth * scale)) / 2; //calculate padding made before feeding in image to undo the preprocessing done on the image
                 int padY = (MODEL_HEIGHT - Math.round(originalHeight * scale)) / 2;
                 
                 float[] box = detection.box;
@@ -132,13 +160,15 @@ public class YOLO_Detector implements PlugInFilter {
                 // Create and name the signal ROI
                 Roi signalRoi = new Roi(x1, y1, w, h);
                 String label = (detection.classId < classNames.length) ? classNames[detection.classId] : "Unknown";
+
                 signalRoi.setName(String.format("%s: %.2f", label, detection.confidence));
                 signalRois.add(signalRoi);
 
-                // Create the wider background ROI
-                int w_bg = (int) (w * 1.4);
-                int x1_bg = x - (w_bg / 2);
-                backgroundRois.add(new Roi(x1_bg, y1, w_bg, h));
+                // Create a slightly wider ROI for analysis (2 pixels padding on each side)
+                int padding = 2;
+                int w_analysis = w + (padding * 2);
+                int x1_analysis = x1 - padding;
+                analysisRois.add(new Roi(x1_analysis, y1, w_analysis, h));
             }
 
             // Add signal ROIs to the manager and display them
@@ -151,7 +181,9 @@ public class YOLO_Detector implements PlugInFilter {
             rm.setVisible(true);
 
             // == 4. CALCULATE AND SHOW THE E/P RATIO ==
-            calculateAndShowEPRatio(this.image, signalRois, backgroundRois);
+            calculateAndShowEPRatio(this.image, signalRois, analysisRois);
+
+            rotateAndPlotSignals(this.image, signalRois);
 
             // == 5. CLEAN UP RESOURCES ==
             inputTensor.close();
@@ -165,70 +197,182 @@ public class YOLO_Detector implements PlugInFilter {
     /**
      * Performs background subtraction using a polynomial fit and calculates the E/P ratio.
      */
-    private void calculateAndShowEPRatio(ImagePlus imp, List<Roi> signalRois, List<Roi> backgroundRois) {
-        if (signalRois.size() != 2) {
-            IJ.log("Error: Expected exactly 2 detections (electron and positron) to calculate ratio.");
+    private void calculateAndShowEPRatio(ImagePlus imp, List<Roi> signalRois, List<Roi> analysisRois) {
+        if (signalRois.size() < 2) {
+            IJ.log("Error: Expected at least 2 detections to calculate ratio.");
             return;
         }
 
-        double[] avgedSignal = new double[signalRois.size()];
+        // Use a map to store signals by class name for robust ratio calculation
+        Map<String, Double> averagedSignals = new HashMap<>();
 
         for (int i = 0; i < signalRois.size(); i++) {
             Roi signalRoi = signalRois.get(i);
-            Roi backgroundRoi = backgroundRois.get(i);
+            Roi analysisRoi = analysisRois.get(i);
 
-            // Get profile data for signal and background
+            imp.setRoi(analysisRoi);
+
+            double[] analysisProfile = new ProfilePlot(imp).getProfile();
+            // delete later if not working
             imp.setRoi(signalRoi);
             double[] signalProfile = new ProfilePlot(imp).getProfile();
-
-            imp.setRoi(backgroundRoi);
-            double[] backgroundProfile = new ProfilePlot(imp).getProfile();
-
-            // 1. Isolate the background-only parts of the profile
-            List<Double> bgOnlyValues = new ArrayList<>();
-            int signalStart = (backgroundProfile.length - signalProfile.length) / 2;
-            for (int j = 0; j < backgroundProfile.length; j++) {
-                if (j < signalStart || j >= signalStart + signalProfile.length) {
-                    bgOnlyValues.add(backgroundProfile[j]);
-                }
+            String fullName = signalRoi.getName();
+            // 2. Split the name by the colon and get the first part ("electron")
+            String roiName = fullName.split(":")[0].trim();
+            if (analysisProfile == null || analysisProfile.length < 3) {
+                IJ.log("Could not generate a valid profile for " + roiName + ". Skipping.");
+                continue;
             }
 
-            // 2. Prepare data for polynomial fitting (x, y points)
+            // 1. Prepare 3 specific points for the quadratic fit
             List<WeightedObservedPoint> observations = new ArrayList<>();
-            for (int j = 0; j < bgOnlyValues.size(); j++) {
-                // The 'x' is the pixel index, 'y' is the intensity
-                observations.add(new WeightedObservedPoint(1.0, j, bgOnlyValues.get(j)));
-            }
+            
+            // Point 1: First pixel (x=0)
+            observations.add(new WeightedObservedPoint(1.0, 0, analysisProfile[0]));
+            // Point 2: Second pixel (x=1)
+            observations.add(new WeightedObservedPoint(1.0, 1, analysisProfile[1]));
+            // Point 3: Last pixel (x=n-1)
+            int last_x = analysisProfile.length - 1;
+            observations.add(new WeightedObservedPoint(1.0, last_x, analysisProfile[last_x]));
 
-            // 3. Fit the polynomial to the background data
+            // 2. Fit the quadratic polynomial to the three background points
             PolynomialCurveFitter fitter = PolynomialCurveFitter.create(2); // 2nd degree polynomial
             double[] coefficients = fitter.fit(observations);
             PolynomialFunction polynomial = new PolynomialFunction(coefficients);
 
-            // 4. Subtract the fitted background from the original signal
+            // 3. Subtract the fitted background from the signal portion of the profile
             double sumOfSubtractedSignal = 0;
-            for (int j = 0; j < signalProfile.length; j++) {
-                // The 'x' value for the polynomial is the pixel's position within the signal profile
-                double backgroundValue = polynomial.value(j + signalStart);
-                double subtractedValue = signalProfile[j] - backgroundValue;
+            int signalWidth = signalRoi.getBounds().width;
+            int signalHeight = signalRoi.getBounds().height;
+            int signalStartInAnalysis = (analysisProfile.length - signalWidth) / 2;
+            // change to signalWidth if not working
+            for (int j = 0; j < signalWidth; j++) {
+                int x_pos = j + signalStartInAnalysis;
+                double signalValue = analysisProfile[x_pos];
+                //double backgroundValue = polynomial.value(x_pos);
+                double backgroundValue = ((signalProfile[0]+signalProfile[signalProfile.length - 1])/2);
+                double subtractedValue = signalValue - backgroundValue;
                 sumOfSubtractedSignal += subtractedValue;
             }
             
-            // 5. Calculate the average signal after subtraction
-            avgedSignal[i] = sumOfSubtractedSignal / signalProfile.length;
+            // 4. Calculate and store the average signal
+            averagedSignals.put(roiName, sumOfSubtractedSignal);
         }
+
+        // Restore the original full image view by removing any set ROI
         imp.killRoi();
-        // 6. Calculate and display the E/P Ratio
-        // NOTE: This assumes the first ROI is the electron and the second is the positron.
-        // A more robust implementation would check the ROI names.
-        double EPratio = avgedSignal[0] / avgedSignal[1];
-        
-        IJ.log("Electron Avg Signal: " + avgedSignal[0]);
-        IJ.log("Positron Avg Signal: " + avgedSignal[1]);
-        IJ.log("E/P Ratio: " + EPratio);
-        IJ.showMessage("Calculation Complete", "The calculated E/P Ratio is: " + String.format("%.4f", EPratio));
+
+        // 5. Robustly calculate and display the E/P Ratio
+        if (averagedSignals.containsKey("electron") && averagedSignals.containsKey("positron")) {
+            double electronSignal = averagedSignals.get("electron");
+            double positronSignal = averagedSignals.get("positron");
+            
+            // Avoid division by zero
+            if (positronSignal == 0) {
+                IJ.log("Error: Positron signal is zero. Cannot calculate ratio.");
+                return;
+            }
+
+            double EPratio = electronSignal / positronSignal;
+            
+            IJ.log("Electron Avg Signal: " + String.format("%.4f", electronSignal));
+            IJ.log("Positron Avg Signal: " + String.format("%.4f", positronSignal));
+            IJ.log("E/P Ratio: " + String.format("%.4f", EPratio));
+            IJ.showMessage("Calculation Complete", "The calculated E/P Ratio is: " + String.format("%.4f", EPratio));
+        } else {
+            IJ.log("Could not calculate E/P ratio. Found signals: " + averagedSignals.keySet());
+        }
     }
 
+    /**
+     * Rotates the image and ROIs, creates background ROIs, performs background
+     * subtraction on the profile data, and plots the final result.
+     * @param verticalImage The original, vertically oriented ImagePlus.
+     * @param verticalRois The list of ROIs detected on the vertical image.
+     */
+    private void rotateAndPlotSignals(ImagePlus verticalImage, List<Roi> verticalRois) {
+        // 1. Rotate the entire image 90 degrees to the right
+        ImageProcessor verticalIp = verticalImage.getProcessor();
+        ImageProcessor horizontalIp = verticalIp.rotateRight();
+        ImagePlus horizontalImage = new ImagePlus("Horizontal - " + verticalImage.getTitle(), horizontalIp);
+        horizontalImage.show();
+
+        // 2. Create a new RoiManager to display all our analysis ROIs
+        RoiManager rm = new RoiManager();
+        rm.reset();
+
+        int verticalImageWidth = verticalImage.getWidth();
+
+        // 3. Loop through each detected signal to perform the analysis
+        for (Roi verticalRoi : verticalRois) {
+            java.awt.Rectangle r = verticalRoi.getBounds();
+
+            // --- ROI Transformation Math ---
+            int newX = r.y;
+            int newY = verticalImageWidth - (r.x + r.width);
+            int newWidth = r.height;
+            int newHeight = r.width;
+            
+            // --- Create Signal and Background ROIs ---
+            Roi signalRoi = new Roi(newX, newY, newWidth, newHeight);
+            signalRoi.setName(verticalRoi.getName());
+            signalRoi.setStrokeColor(java.awt.Color.YELLOW); // Set signal ROI color
+            rm.addRoi(signalRoi);
+
+            // Define a gap between the signal and background ROIs
+            int backgroundGap = 3; // 5 pixels
+
+            // Create ROI for background ABOVE the signal
+            Roi bgRoiAbove = new Roi(newX, newY - newHeight - backgroundGap, newWidth, newHeight);
+            bgRoiAbove.setName("BG_Above_" + verticalRoi.getName());
+            bgRoiAbove.setStrokeColor(java.awt.Color.CYAN);
+            rm.addRoi(bgRoiAbove);
+
+            // Create ROI for background BELOW the signal
+            Roi bgRoiBelow = new Roi(newX, newY + newHeight + backgroundGap, newWidth, newHeight);
+            bgRoiBelow.setName("BG_Below_" + verticalRoi.getName());
+            bgRoiBelow.setStrokeColor(java.awt.Color.CYAN);
+            rm.addRoi(bgRoiBelow);
+            
+            // --- Extract Profile Data from all 3 ROIs ---
+            horizontalImage.setRoi(signalRoi);
+            double[] signalProfile = new ProfilePlot(horizontalImage).getProfile();
+            
+            horizontalImage.setRoi(bgRoiAbove);
+            double[] bgProfileAbove = new ProfilePlot(horizontalImage).getProfile();
+            
+            horizontalImage.setRoi(bgRoiBelow);
+            double[] bgProfileBelow = new ProfilePlot(horizontalImage).getProfile();
+            
+            // --- Process the Data ---
+            // First, check if all profiles are valid and have the same length
+            if (signalProfile == null || bgProfileAbove == null || bgProfileBelow == null || 
+                signalProfile.length != bgProfileAbove.length || signalProfile.length != bgProfileBelow.length) {
+                IJ.log("Skipping profile for " + signalRoi.getName() + " due to mismatched profile lengths.");
+                continue; // Skip to the next ROI
+            }
+            
+            // Create an array to hold the final, subtracted data
+            double[] subtractedProfile = new double[signalProfile.length];
+            
+            // Loop through each data point to subtract the averaged background
+            for (int i = 0; i < signalProfile.length; i++) {
+                // Calculate the average background value for this x-position
+                double avgBackground = (bgProfileAbove[i] + bgProfileBelow[i]) / 2.0;
+                // Subtract it from the signal and store it
+                subtractedProfile[i] = signalProfile[i] - avgBackground;
+            }
+
+            // --- Plot the Final, Processed Data ---
+            // Use the generic Plot class for custom data arrays
+            Plot finalPlot = new Plot("Subtracted Profile: " + signalRoi.getName(), "Distance (pixels)", "Subtracted Intensity");
+            finalPlot.add("line", subtractedProfile); // Add our processed data
+            finalPlot.show(); // Display the plot in a new window
+        }
+        
+        rm.setVisible(true); // Show the RoiManager with all three ROIs
+        horizontalImage.killRoi(); // Clear selection from the image
+    }
     private float[] preprocessImage(ImageProcessor ip, int targetWidth, int targetHeight) {
         int originalWidth = ip.getWidth();
         int originalHeight = ip.getHeight();
