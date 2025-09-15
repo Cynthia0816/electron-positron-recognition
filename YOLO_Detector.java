@@ -298,8 +298,10 @@ public class YOLO_Detector implements PlugInFilter {
         horizontalImage.show();
 
         // 2. Create a new RoiManager to display all our analysis ROIs
-        RoiManager rm = new RoiManager();
-        rm.reset();
+        RoiManager rm = RoiManager.getInstance2();
+        if (rm == null)
+            rm = new RoiManager(); // Create it only if it doesn't exist
+        rm.reset(); // This is important to clear the old vertical ROIs
 
         int verticalImageWidth = verticalImage.getWidth();
 
