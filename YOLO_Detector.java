@@ -165,7 +165,7 @@ public class YOLO_Detector implements PlugInFilter {
                 signalRois.add(signalRoi);
 
                 // Create a slightly wider ROI for analysis (2 pixels padding on each side)
-                int padding = 2;
+                int padding = 10;
                 int w_analysis = w + (padding * 2);
                 int x1_analysis = x1 - padding;
                 analysisRois.add(new Roi(x1_analysis, y1, w_analysis, h));
@@ -197,90 +197,117 @@ public class YOLO_Detector implements PlugInFilter {
     /**
      * Performs background subtraction using a polynomial fit and calculates the E/P ratio.
      */
+// --- This is the fully updated 'calculateAndShowEPRatio' method ---
+
     private void calculateAndShowEPRatio(ImagePlus imp, List<Roi> signalRois, List<Roi> analysisRois) {
         if (signalRois.size() < 2) {
             IJ.log("Error: Expected at least 2 detections to calculate ratio.");
             return;
         }
 
-        // Use a map to store signals by class name for robust ratio calculation
-        Map<String, Double> averagedSignals = new HashMap<>();
+        // Use maps to store results by class name for robust calculation
+        Map<String, Double> summedSignals = new HashMap<>();
+        Map<String, Double> rSquaredValues = new HashMap<>(); // Map to store R^2 values
 
         for (int i = 0; i < signalRois.size(); i++) {
             Roi signalRoi = signalRois.get(i);
             Roi analysisRoi = analysisRois.get(i);
+            String roiName = signalRoi.getName().split(":")[0].trim();
 
             imp.setRoi(analysisRoi);
-
             double[] analysisProfile = new ProfilePlot(imp).getProfile();
-            // delete later if not working
-            imp.setRoi(signalRoi);
-            double[] signalProfile = new ProfilePlot(imp).getProfile();
-            String fullName = signalRoi.getName();
-            // 2. Split the name by the colon and get the first part ("electron")
-            String roiName = fullName.split(":")[0].trim();
-            if (analysisProfile == null || analysisProfile.length < 3) {
+            
+            if (analysisProfile == null || analysisProfile.length < 5) { // Need at least 5 pts for a decent fit
                 IJ.log("Could not generate a valid profile for " + roiName + ". Skipping.");
                 continue;
             }
 
-            // 1. Prepare 3 specific points for the quadratic fit
+            // --- 1. GATHER A LARGER SET OF BACKGROUND POINTS ---
             List<WeightedObservedPoint> observations = new ArrayList<>();
-            
-            // Point 1: First pixel (x=0)
-            observations.add(new WeightedObservedPoint(1.0, 0, analysisProfile[0]));
-            // Point 2: Second pixel (x=1)
-            observations.add(new WeightedObservedPoint(1.0, 1, analysisProfile[1]));
-            // Point 3: Last pixel (x=n-1)
-            int last_x = analysisProfile.length - 1;
-            observations.add(new WeightedObservedPoint(1.0, last_x, analysisProfile[last_x]));
+            int signalWidth = signalRoi.getBounds().width;
+            // Determine how many pixels of padding are on each side
+            int paddingWidth = (analysisProfile.length - signalWidth) / 2;
 
-            // 2. Fit the quadratic polynomial to the three background points
-            PolynomialCurveFitter fitter = PolynomialCurveFitter.create(2); // 2nd degree polynomial
+            // Add points from the left-side background padding
+            for (int j = 0; j < paddingWidth; j++) {
+                observations.add(new WeightedObservedPoint(1.0, j, analysisProfile[j]));
+            }
+            // Add points from the right-side background padding
+            for (int j = 0; j < paddingWidth; j++) {
+                int x_pos = signalWidth + paddingWidth + j;
+                if (x_pos < analysisProfile.length) { // Boundary check
+                    observations.add(new WeightedObservedPoint(1.0, x_pos, analysisProfile[x_pos]));
+                }
+            }
+            
+            if (observations.size() <= 2) {
+                IJ.log("Not enough background points to fit polynomial for " + roiName);
+                continue;
+            }
+
+            // --- 2. FIT THE POLYNOMIAL TO THE BACKGROUND POINTS ---
+            // You can change the degree here (e.g., 1 for linear, 2 for quadratic)
+            int polynomialDegree = 2; 
+            PolynomialCurveFitter fitter = PolynomialCurveFitter.create(polynomialDegree);
             double[] coefficients = fitter.fit(observations);
             PolynomialFunction polynomial = new PolynomialFunction(coefficients);
 
-            // 3. Subtract the fitted background from the signal portion of the profile
+            // --- 3. CALCULATE THE R-SQUARED VALUE FOR THE FIT ---
+            double sumOfSquaresTotal = 0;
+            double sumOfSquaresResidual = 0;
+            double meanY = 0;
+            for (WeightedObservedPoint p : observations) {
+                meanY += p.getY();
+            }
+            meanY /= observations.size();
+
+            for (WeightedObservedPoint p : observations) {
+                double predictedY = polynomial.value(p.getX());
+                sumOfSquaresTotal += Math.pow(p.getY() - meanY, 2);
+                sumOfSquaresResidual += Math.pow(p.getY() - predictedY, 2);
+            }
+
+            double rSquared = (sumOfSquaresTotal > 0) ? (1.0 - (sumOfSquaresResidual / sumOfSquaresTotal)) : 1.0;
+            rSquaredValues.put(roiName, rSquared);
+
+
+            // --- 4. SUBTRACT BACKGROUND AND SUM THE SIGNAL ---
             double sumOfSubtractedSignal = 0;
-            int signalWidth = signalRoi.getBounds().width;
-            int signalHeight = signalRoi.getBounds().height;
-            int signalStartInAnalysis = (analysisProfile.length - signalWidth) / 2;
-            // change to signalWidth if not working
+            int signalStartInAnalysis = paddingWidth;
             for (int j = 0; j < signalWidth; j++) {
                 int x_pos = j + signalStartInAnalysis;
                 double signalValue = analysisProfile[x_pos];
-                //double backgroundValue = polynomial.value(x_pos);
-                double backgroundValue = ((signalProfile[0]+signalProfile[signalProfile.length - 1])/2);
+                double backgroundValue = polynomial.value(x_pos); // Use the new polynomial fit
                 double subtractedValue = signalValue - backgroundValue;
                 sumOfSubtractedSignal += subtractedValue;
             }
-            
-            // 4. Calculate and store the average signal
-            averagedSignals.put(roiName, sumOfSubtractedSignal);
+            summedSignals.put(roiName, sumOfSubtractedSignal);
         }
 
-        // Restore the original full image view by removing any set ROI
         imp.killRoi();
 
-        // 5. Robustly calculate and display the E/P Ratio
-        if (averagedSignals.containsKey("electron") && averagedSignals.containsKey("positron")) {
-            double electronSignal = averagedSignals.get("electron");
-            double positronSignal = averagedSignals.get("positron");
+        // --- 5. CALCULATE AND DISPLAY THE E/P RATIO AND R^2 VALUES ---
+        if (summedSignals.containsKey("electron") && summedSignals.containsKey("positron")) {
+            double electronSignal = summedSignals.get("electron");
+            double positronSignal = summedSignals.get("positron");
+            double electronR2 = rSquaredValues.get("electron");
+            double positronR2 = rSquaredValues.get("positron");
             
-            // Avoid division by zero
-            if (positronSignal == 0) {
+            IJ.log("--- Background Fit & Signal Calculation ---");
+            IJ.log(String.format("Electron Signal: %.4f (Fit R^2: %.4f)", electronSignal, electronR2));
+            IJ.log(String.format("Positron Signal: %.4f (Fit R^2: %.4f)", positronSignal, positronR2));
+            
+            if (positronSignal != 0) {
+                double EPratio = electronSignal / positronSignal;
+                IJ.log("E/P Ratio: " + String.format("%.4f", EPratio));
+                IJ.showMessage("Calculation Complete", 
+                    String.format("Electron Signal: %.4f (R^2: %.4f)\nPositron Signal: %.4f (R^2: %.4f)\nE/P Ratio: %.4f",
+                    electronSignal, electronR2, positronSignal, positronR2, EPratio));
+            } else {
                 IJ.log("Error: Positron signal is zero. Cannot calculate ratio.");
-                return;
             }
-
-            double EPratio = electronSignal / positronSignal;
-            
-            IJ.log("Electron Avg Signal: " + String.format("%.4f", electronSignal));
-            IJ.log("Positron Avg Signal: " + String.format("%.4f", positronSignal));
-            IJ.log("E/P Ratio: " + String.format("%.4f", EPratio));
-            IJ.showMessage("Calculation Complete", "The calculated E/P Ratio is: " + String.format("%.4f", EPratio));
         } else {
-            IJ.log("Could not calculate E/P ratio. Found signals: " + averagedSignals.keySet());
+            IJ.log("Could not calculate E/P ratio. Found signals: " + summedSignals.keySet());
         }
     }
 
