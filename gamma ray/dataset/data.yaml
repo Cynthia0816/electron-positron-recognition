@@ -1,0 +1,4 @@
+train: ../dataset/images/train
+val: ../dataset/images/valid
+nc: 1
+names: ['gamma ray']
