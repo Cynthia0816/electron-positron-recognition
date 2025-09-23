@@ -4,6 +4,10 @@ Below is a list of instructions/details on how to work the overall pipeline of t
 For training the detection model, this Google Colab notebook is used: https://colab.research.google.com/drive/1WeB_pgQrNuaPgTek0PEc_UdxGd4z4vPK?usp=sharing.
 
 For this project a YOLO object detection model is used in order to automate detection of signals within images we feed in. In the Google Colab notebook, we load in a pre-trained YOLOv8 model and fine-tune it on an annotated dataset of signals. This dataset should be uploaded to your Google Drive where it is loaded inside of the notebook. At the end of this notebook, a cell is run to export this training yolo model as a `.onnx` file. This will be imported in the java plugin script.
+
+Before you use your dataset folder, the labels needs to be "normalized" for yolo model to process otherwise it thinks your coordinates in the label is invalid/corrupt, to normalize your label coordinates, use this code here: https://drive.google.com/file/d/1roOvMnjkHlxnCe82bqgSaC8QxddGh4s8/view?usp=sharing
+This code outputs a "label normalized" folder to your original labels folder, make sure you delete your original label folder and rename "label normalized" to "label" to replace your labels to the now normalized ones
+
 # Building the Java Plugin
 The `YOLO_detector.java` file stores the entire Java script for the ImageJ plugin. The path of the ImageJ install and the `.onnx` file are explicitly assumed within the script, so these values may need to be changed locally.
 
