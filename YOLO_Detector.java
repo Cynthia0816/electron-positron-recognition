@@ -45,35 +45,20 @@ class Detection {
     }
 }
 
-/*
- * J-COMMENT: This is the main class for our plugin.
- * 'implements PlugInFilter' tells ImageJ that this class is a standard plugin
- * that can be run on an image. It requires us to provide the 'setup' and 'run' methods.
- */
-    // J-COMMENT: 'private' variables are only accessible within this YOLO_Detector class.
 public class YOLO_Detector implements PlugInFilter {
     private ImagePlus image;
     private static OrtEnvironment env;
     
-    // --- UPDATED: Manage two separate sessions ---
-    private static OrtSession epSession; // For Electron-Positron model
-    private static OrtSession gammaSession; // For Gamma Ray model
+    private static OrtSession epSession; // For Electron Positron
+    private static OrtSession gammaSession; // For Gamma Ray
 
-    // --- IMPORTANT: UPDATE BOTH PATHS ---
+    //to whoever use my code: make sure you change this for your own local file directory
     private static final String EP_MODEL_PATH = "C:/Users/admin/Downloads/ij154-win-java8/ImageJ/plugins/best.onnx";
     private static final String GAMMA_MODEL_PATH = "C:/Users/admin/Downloads/ij154-win-java8/ImageJ/plugins/gamma.onnx";
 
     private final int MODEL_WIDTH = 1024;
     private final int MODEL_HEIGHT = 1024;
 
-    
-    //...
-
-    /*
-     * J-COMMENT: '@Override' is an annotation that tells the compiler we are intentionally
-     * replacing a method from the 'PlugInFilter' interface. This helps catch typos.
-     * This 'setup' method is called by ImageJ once when the plugin starts.
-     */
     @Override
     public int setup(String arg, ImagePlus imp) {
         if (imp == null) {
@@ -82,8 +67,6 @@ public class YOLO_Detector implements PlugInFilter {
         }
         this.image = imp;
 
-        // Initialize the ONNX environment once.
-        // No try-catch is needed here as getEnvironment() does not throw a checked OrtException.
         if (env == null) {
             env = OrtEnvironment.getEnvironment();
         }
@@ -93,28 +76,28 @@ public class YOLO_Detector implements PlugInFilter {
     
     @Override
     public void run(ImageProcessor ip) {
-        // --- 1. Create the Dialog Window ---
+        // Create the dialog Window
         GenericDialog gd = new GenericDialog("Select Analysis Type");
         String[] choices = {"Electron/Positron", "Gamma Ray"};
         gd.addChoice("Analysis Workflow:", choices, choices[0]); // Adds a dropdown menu
 
-        // --- 2. Show the Dialog and Wait for User Input ---
+        // Show the Dialog and Wait for User Input
         gd.showDialog();
 
-        // Exit the plugin if the user clicks "Cancel"
+        // Exit the plugin if clicks "Cancel"
         if (gd.wasCanceled()) {
             return;
         }
 
-        // --- 3. Get the User's Choice and Run the Correct Workflow ---
+        // Get the User Choice and Run the Correct Workflow
         String userChoice = gd.getNextChoice();
 
         try {
             if (userChoice.equals("Electron/Positron")) {
-                IJ.log("--- Running Electron/Positron Workflow ---");
+                IJ.log("Running Electron/Positron");
                 runElectronPositronWorkflow(ip);
             } else if (userChoice.equals("Gamma Ray")) {
-                IJ.log("--- Running Gamma Ray Workflow ---");
+                IJ.log("Running Gamma Ray");
                 runGammaWorkflow(ip);
             }
         } catch (Exception e) {
@@ -126,28 +109,26 @@ public class YOLO_Detector implements PlugInFilter {
 
 /**
  * Manages the entire workflow for Electron/Positron (MS) images.
- */
+*/
     private void runElectronPositronWorkflow(ImageProcessor ip) throws OrtException {
-        // Lazy-load the E/P model only when needed
+        // load the E/P model only when needed
         if (epSession == null) {
             epSession = env.createSession(EP_MODEL_PATH, new OrtSession.SessionOptions());
-            IJ.log("Electron/Positron ONNX model loaded successfully.");
         }
 
-        // Use a "try-with-resources" block to ensure the tensor is always closed
+        // use a try with resources block to ensure the tensor is always closed
         try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT)), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH})) {
             
-            // CORRECTED: Use epSession here
             String inputName = epSession.getInputNames().iterator().next();
 
-            // The "results" object is also managed by the try-with-resources block
+            // The "results" object is managed by the try with resources block also
             try (OrtSession.Result results = epSession.run(Collections.singletonMap(inputName, inputTensor))) {
 
-                // == 1. PROCESS RESULTS ==
+                // process results
                 float[][][] outputData = (float[][][]) results.get(0).getValue();
                 float[][] transposedData = transpose(outputData[0]);
 
-                // == 2. FILTER DETECTIONS TO GET BEST FOR EACH CLASS ==
+                //Filter detections to get the best from each class
                 Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();
                 float confidenceThreshold = 0.25f;
                 for (float[] detectionData : transposedData) {
@@ -170,13 +151,13 @@ public class YOLO_Detector implements PlugInFilter {
                     }
                 }
                 
-                // If no valid detections were found, exit early.
+                // If no valid detections were found, exit early
                 if (bestDetectionsPerClass.isEmpty()) {
-                    IJ.log("No electron or positron signals detected above the confidence threshold.");
+                    IJ.log("No electron or positron signals detected above the confidence threshold");
                     return;
                 }
 
-                // == 3. CREATE SIGNAL AND BACKGROUND ROIs ==
+                // create signal and background ROIs
                 String[] classNames = {"electron", "positron"};
                 List<Roi> signalRois = new ArrayList<>();
                 List<Roi> analysisRois = new ArrayList<>();
@@ -208,32 +189,29 @@ public class YOLO_Detector implements PlugInFilter {
                     analysisRois.add(new Roi(x1 - padding, y1, w + (padding * 2), h));
                 }
 
-                // == 4. PERFORM ANALYSIS AND PLOTTING ==
+                // Perform analysis and plotting
                 calculateAndShowEPRatio(this.image, signalRois, analysisRois);
                 rotateAndPlotSignals(this.image, signalRois);
             }
-        // The try-with-resources statement automatically closes the tensor and results here
+        // The try with resources statement automatically closes the tensor and resultshere
         }
     }
 
     private void runGammaWorkflow(ImageProcessor ip) throws OrtException {
         if (gammaSession == null) {
             gammaSession = env.createSession(GAMMA_MODEL_PATH, new OrtSession.SessionOptions());
-            IJ.log("Gamma Ray ONNX model loaded successfully.");
         }
 
-        // CORRECTED: Use try-with-resources for the input tensor
         try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT)), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH})) {
             
             String inputName = gammaSession.getInputNames().iterator().next();
             
             try (OrtSession.Result results = gammaSession.run(Collections.singletonMap(inputName, inputTensor))) {
                 
-                // == 1. FILTER DETECTIONS (This logic was correct) ==
+                // filter detections
                 float[][][] outputData = (float[][][]) results.get(0).getValue();
                 float[][] transposedData = transpose(outputData[0]);
-                Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();
-                // ... (The filtering logic for bestDetectionsPerClass is fine) ...
+                Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();.
                 float confidenceThreshold = 0.25f;
                 for (float[] detectionData : transposedData) {
                     float[] classScores = new float[detectionData.length - 4];
@@ -255,14 +233,14 @@ public class YOLO_Detector implements PlugInFilter {
                     }
                 }
                 
-                // If no valid detections were found, exit early.
+                // If no valid detections were found, exit early
                 if (bestDetectionsPerClass.isEmpty()) {
                     IJ.log("No gamma ray signals detected above the confidence threshold.");
                     return;
                 }
                 
 
-                // == 2. CREATE ROIs FROM DETECTIONS (This part was missing) ==
+                // create rois from detections
                 List<Roi> signalRois = new ArrayList<>();
                 List<Roi> analysisRois = new ArrayList<>();
                 String[] classNames = {"gamma"};
@@ -270,7 +248,7 @@ public class YOLO_Detector implements PlugInFilter {
                 int originalHeight = ip.getHeight();
 
                 for (Detection detection : bestDetectionsPerClass.values()) {
-                    // This is the essential logic to convert detection coordinates to ROI coordinates
+                    // logic to convert detection coordinates to ROI coordinates
                     float scale = Math.min((float) MODEL_WIDTH / originalWidth, (float) MODEL_HEIGHT / originalHeight);
                     int padX = (MODEL_WIDTH - Math.round(originalWidth * scale)) / 2;
                     int padY = (MODEL_HEIGHT - Math.round(originalHeight * scale)) / 2;
@@ -289,7 +267,7 @@ public class YOLO_Detector implements PlugInFilter {
                     analysisRois.add(new Roi(x1 - padding, y1, w + (padding * 2), h));
                 }
 
-                // == 3. DISPLAY ROIs AND ANALYZE ==
+                // DISPLAY ROIs AND ANALYZE
                 Overlay gammaOverlay = new Overlay();
                 for(Roi roi : signalRois) {
                     roi.setStrokeColor(java.awt.Color.GREEN);
@@ -297,25 +275,38 @@ public class YOLO_Detector implements PlugInFilter {
                 }
                 this.image.setOverlay(gammaOverlay);
 
-                IJ.log("Found " + signalRois.size() + " gamma signal(s). Generating plots...");
                 for (int i = 0; i < signalRois.size(); i++) {
-                    FitResult result = calculateSignalWithPolynomialFit(this.image, signalRois.get(i), analysisRois.get(i));
+                    Roi currentSignalRoi = signalRois.get(i);
+                    Roi currentAnalysisRoi = analysisRois.get(i);
+                    
+                    FitResult result = calculateSignalWithPolynomialFit(this.image, currentSignalRoi, currentAnalysisRoi);
+                    
                     if (result != null) {
-                        Plot subtractedPlot = new Plot("Subtracted Profile: " + signalRois.get(i).getName(), "Distance (pixels)", "Subtracted Intensity");
+                        IJ.log(String.format("Signal for %s, Fit R^2: %.4f", currentSignalRoi.getName(),result.rSquared));
+                        
+                        // The subtracted Profile
+                        Plot subtractedPlot = new Plot("Subtracted Profile: " + currentSignalRoi.getName(), "Distance (pixels)", "Subtracted Intensity");
                         subtractedPlot.add("line", result.subtractedProfile);
                         subtractedPlot.show();
+
+                        // Get the raw profile data directly from the signal ROI
+                        this.image.setRoi(currentSignalRoi);
+                        double[] rawSignalProfile = new ProfilePlot(this.image).getProfile();
+                        
+                        // Check if the profile was created successfully
+                        if (rawSignalProfile != null) {
+                            Plot rawPlot = new Plot("Raw Profile: " + currentSignalRoi.getName(), "Distance (pixels)", "Raw Intensity");
+                            rawPlot.add("line", rawSignalProfile);
+                            rawPlot.show();
+                        }
+                    }
                 }
             }
         }
     }
 /**
- * Reusable method to generate a raw plot and a background-subtracted plot for a given ROI.
+ * Performs background subtraction using a polynomial fit and calculates the E/P ratio.
  */
-    /**
-     * Performs background subtraction using a polynomial fit and calculates the E/P ratio.
-     */
-// --- This is the fully updated 'calculateAndShowEPRatio' method ---
-
     private void calculateAndShowEPRatio(ImagePlus imp, List<Roi> signalRois, List<Roi> analysisRois) {
         Map<String, Double> summedSignals = new HashMap<>();
         Map<String, Double> rSquaredValues = new HashMap<>();
@@ -325,7 +316,6 @@ public class YOLO_Detector implements PlugInFilter {
             Roi analysisRoi = analysisRois.get(i);
             String roiName = signalRoi.getName().split(":")[0].trim();
 
-            // Call the new helper method
             FitResult result = calculateSignalWithPolynomialFit(imp, signalRoi, analysisRoi);
             
             if (result != null) {
@@ -335,84 +325,81 @@ public class YOLO_Detector implements PlugInFilter {
         }
             imp.killRoi();
 
-        // --- 5. CALCULATE AND DISPLAY THE E/P RATIO AND R^2 VALUES ---
+        //calculate and display the EP ratio and R2 of the current polynomial
         if (summedSignals.containsKey("electron") && summedSignals.containsKey("positron")) {
             double electronSignal = summedSignals.get("electron");
             double positronSignal = summedSignals.get("positron");
             double electronR2 = rSquaredValues.get("electron");
             double positronR2 = rSquaredValues.get("positron");
             
-            IJ.log("--- Background Fit & Signal Calculation ---");
             IJ.log(String.format("Electron Signal: %.4f (Fit R^2: %.4f)", electronSignal, electronR2));
             IJ.log(String.format("Positron Signal: %.4f (Fit R^2: %.4f)", positronSignal, positronR2));
             
             if (positronSignal != 0) {
                 double EPratio = electronSignal / positronSignal;
                 IJ.log("E/P Ratio: " + String.format("%.4f", EPratio));
-                IJ.showMessage("Calculation Complete", 
+                IJ.showMessage("Calculation finished", 
                     String.format("Electron Signal: %.4f (R^2: %.4f)\nPositron Signal: %.4f (R^2: %.4f)\nE/P Ratio: %.4f",
                     electronSignal, electronR2, positronSignal, positronR2, EPratio));
             } else {
-                IJ.log("Error: Positron signal is zero. Cannot calculate ratio.");
+                IJ.log("Positron signal is zero Cant calculate ratio");
             }
         } else {
-            IJ.log("Could not calculate E/P ratio. Found signals: " + summedSignals.keySet());
+            IJ.log("Could not calculate EP ratio. Found signals: " + summedSignals.keySet());
         }
     }
 
     /**
      * Rotates the image and ROIs, creates background ROIs, performs background
      * subtraction on the profile data, and plots the final result.
-     * @param verticalImage The original, vertically oriented ImagePlus.
-     * @param verticalRois The list of ROIs detected on the vertical image.
      */
     private void rotateAndPlotSignals(ImagePlus verticalImage, List<Roi> verticalRois) {
-        // 1. Rotate the entire image 90 degrees to the right
+        // Rotate the entire image 90 degrees to the right
         ImageProcessor verticalIp = verticalImage.getProcessor();
         ImageProcessor horizontalIp = verticalIp.rotateRight();
         ImagePlus horizontalImage = new ImagePlus("Horizontal - " + verticalImage.getTitle(), horizontalIp);
         horizontalImage.show();
 
-        // 2. Create a new RoiManager to display all our analysis ROIs
+        // Create a new RoiManager to display all our analysis ROIs
         RoiManager rm = RoiManager.getInstance2();
         if (rm == null)
             rm = new RoiManager(); // Create it only if it doesn't exist
-        rm.reset(); // This is important to clear the old vertical ROIs
+        rm.reset(); // clear the old vertical ROIs
 
         int verticalImageWidth = verticalImage.getWidth();
 
-        // 3. Loop through each detected signal to perform the analysis
+        // Loop through each detected signal to perform the analysis
         for (Roi verticalRoi : verticalRois) {
             java.awt.Rectangle r = verticalRoi.getBounds();
 
-            // --- ROI Transformation Math ---
+            // ROI transformation math
             int newX = r.y;
             int newY = verticalImageWidth - (r.x + r.width);
             int newWidth = r.height;
             int newHeight = r.width;
             
-            // --- Create Signal and Background ROIs ---
+            // Create signal and background ROIs
             Roi signalRoi = new Roi(newX, newY, newWidth, newHeight);
             signalRoi.setName(verticalRoi.getName());
             signalRoi.setStrokeColor(java.awt.Color.YELLOW); // Set signal ROI color
             rm.addRoi(signalRoi);
 
             // Define a gap between the signal and background ROIs
-            int backgroundGap = 3; // 5 pixels
+            int backgroundGap = 3; // in pixels
 
-            // Create ROI for background ABOVE the signal
+            // Create ROI for background above the signal
             Roi bgRoiAbove = new Roi(newX, newY - newHeight - backgroundGap, newWidth, newHeight);
             bgRoiAbove.setName("BG_Above_" + verticalRoi.getName());
             bgRoiAbove.setStrokeColor(java.awt.Color.CYAN);
             rm.addRoi(bgRoiAbove);
 
-            // Create ROI for background BELOW the signal
+            // Create ROI for background below the signal
             Roi bgRoiBelow = new Roi(newX, newY + newHeight + backgroundGap, newWidth, newHeight);
             bgRoiBelow.setName("BG_Below_" + verticalRoi.getName());
             bgRoiBelow.setStrokeColor(java.awt.Color.CYAN);
             rm.addRoi(bgRoiBelow);
             
-            // --- Extract Profile Data from all 3 ROIs ---
+            // Extract profile data from all 3 ROIs 
             horizontalImage.setRoi(signalRoi);
             double[] signalProfile = new ProfilePlot(horizontalImage).getProfile();
             
@@ -422,29 +409,27 @@ public class YOLO_Detector implements PlugInFilter {
             horizontalImage.setRoi(bgRoiBelow);
             double[] bgProfileBelow = new ProfilePlot(horizontalImage).getProfile();
             
-            // --- Process the Data ---
-            // First, check if all profiles are valid and have the same length
+            // Process the Data
+            // First check if all profiles are valid and have same length
             if (signalProfile == null || bgProfileAbove == null || bgProfileBelow == null || 
                 signalProfile.length != bgProfileAbove.length || signalProfile.length != bgProfileBelow.length) {
-                IJ.log("Skipping profile for " + signalRoi.getName() + " due to mismatched profile lengths.");
-                continue; // Skip to the next ROI
+                continue; // Skip to next ROI
             }
             
-            // Create an array to hold the final, subtracted data
+            // Create array to hold the final subtracted data
             double[] subtractedProfile = new double[signalProfile.length];
             
             // Loop through each data point to subtract the averaged background
             for (int i = 0; i < signalProfile.length; i++) {
-                // Calculate the average background value for this x-position
+                // Calculate the average background value for this x
                 double avgBackground = (bgProfileAbove[i] + bgProfileBelow[i]) / 2.0;
                 // Subtract it from the signal and store it
                 subtractedProfile[i] = signalProfile[i] - avgBackground;
             }
 
-            // --- Plot the Final, Processed Data ---
-            // Use the generic Plot class for custom data arrays
+            // Plot the final processed Data
             Plot finalPlot = new Plot("Subtracted Profile: " + signalRoi.getName(), "Distance (pixels)", "Subtracted Intensity");
-            finalPlot.add("line", subtractedProfile); // Add our processed data
+            finalPlot.add("line", subtractedProfile); // Add processed data
             finalPlot.show(); // Display the plot in a new window
         }
         
@@ -498,24 +483,20 @@ public class YOLO_Detector implements PlugInFilter {
         return transposed;
     }
 
-        /**
+     /**
      * Performs a polynomial background fit and calculates the summed signal, R^2 value,
      * and the subtracted profile data.
-     * @param imp The ImagePlus to analyze.
-     * @param signalRoi The ROI defining the signal region.
-     * @param analysisRoi The wider ROI containing signal and background padding.
-     * @return A FitResult object containing the calculated values, or null if an error occurs.
      */
     private FitResult calculateSignalWithPolynomialFit(ImagePlus imp, Roi signalRoi, Roi analysisRoi) {
         imp.setRoi(analysisRoi);
         double[] analysisProfile = new ProfilePlot(imp).getProfile();
         
         if (analysisProfile == null || analysisProfile.length < 5) {
-            IJ.log("Could not generate a valid profile. Skipping.");
+            IJ.log("Could not generate a valid profile");
             return null;
         }
 
-        // --- 1. GATHER BACKGROUND POINTS ---
+        // gather background points
         List<WeightedObservedPoint> observations = new ArrayList<>();
         int signalWidth = signalRoi.getBounds().width;
         int paddingWidth = (analysisProfile.length - signalWidth) / 2;
@@ -527,17 +508,12 @@ public class YOLO_Detector implements PlugInFilter {
             }
         }
         
-        if (observations.size() <= 2) {
-            IJ.log("Not enough background points to fit polynomial.");
-            return null;
-        }
-
-        // --- 2. FIT THE POLYNOMIAL (Linear fit is often safest) ---
-        PolynomialCurveFitter fitter = PolynomialCurveFitter.create(1); // Using degree 1 (linear)
+        // fit the polynomial (Linear fit is often safest
+        PolynomialCurveFitter fitter = PolynomialCurveFitter.create(2); // Using degree 1 (linear)
         double[] coefficients = fitter.fit(observations);
         PolynomialFunction polynomial = new PolynomialFunction(coefficients);
 
-        // --- 3. CALCULATE R-SQUARED ---
+        //calculate r squared
         double sumOfSquaresTotal = 0, sumOfSquaresResidual = 0, meanY = 0;
         for (WeightedObservedPoint p : observations) { meanY += p.getY(); }
         meanY /= observations.size();
@@ -548,7 +524,7 @@ public class YOLO_Detector implements PlugInFilter {
         }
         double rSquared = (sumOfSquaresTotal > 0) ? (1.0 - (sumOfSquaresResidual / sumOfSquaresTotal)) : 1.0;
 
-        // --- 4. CALCULATE SUBTRACTED SIGNAL AND PROFILE ---
+        //Calculate subtracted signal and profile
         double sumOfSubtractedSignal = 0;
         double[] subtractedProfile = new double[signalWidth];
         int signalStartInAnalysis = paddingWidth;
@@ -564,9 +540,6 @@ public class YOLO_Detector implements PlugInFilter {
         return new FitResult(sumOfSubtractedSignal, rSquared, subtractedProfile);
     }
 
-    /**
- * A small helper class to hold the results from a polynomial fit calculation.
- */
     private static class FitResult {
         final double summedSignal;
         final double rSquared;
