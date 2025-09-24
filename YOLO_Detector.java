@@ -23,6 +23,8 @@ import org.apache.commons.math3.fitting.PolynomialCurveFitter;
 import org.apache.commons.math3.fitting.WeightedObservedPoint;
 import org.apache.commons.math3.analysis.polynomials.PolynomialFunction;
 import ij.gui.Plot;
+import ij.gui.GenericDialog;
+import ij.gui.Overlay;
 
 /**
  * Helper class to store information about a single object detection. Stores three attributes per "detection"
@@ -48,15 +50,24 @@ class Detection {
  * 'implements PlugInFilter' tells ImageJ that this class is a standard plugin
  * that can be run on an image. It requires us to provide the 'setup' and 'run' methods.
  */
-public class YOLO_Detector implements PlugInFilter {
     // J-COMMENT: 'private' variables are only accessible within this YOLO_Detector class.
+public class YOLO_Detector implements PlugInFilter {
     private ImagePlus image;
     private static OrtEnvironment env;
-    private static OrtSession session;
+    
+    // --- UPDATED: Manage two separate sessions ---
+    private static OrtSession epSession; // For Electron-Positron model
+    private static OrtSession gammaSession; // For Gamma Ray model
 
-    // J-COMMENT: 'final' means this variable is a constant and cannot be changed after it's set.
+    // --- IMPORTANT: UPDATE BOTH PATHS ---
+    private static final String EP_MODEL_PATH = "C:/Users/admin/Downloads/ij154-win-java8/ImageJ/plugins/best.onnx";
+    private static final String GAMMA_MODEL_PATH = "C:/Users/admin/Downloads/ij154-win-java8/ImageJ/plugins/gamma.onnx";
+
     private final int MODEL_WIDTH = 1024;
     private final int MODEL_HEIGHT = 1024;
+
+    
+    //...
 
     /*
      * J-COMMENT: '@Override' is an annotation that tells the compiler we are intentionally
@@ -70,221 +81,259 @@ public class YOLO_Detector implements PlugInFilter {
             return DONE;
         }
         this.image = imp;
-        if (session == null) {
-            try {
-                env = OrtEnvironment.getEnvironment();
-                // --- IMPORTANT: UPDATE THIS PATH ---
-                String modelPath = "C:/Users/admin/Downloads/ij154-win-java8/ImageJ/plugins/best.onnx";
-                session = env.createSession(modelPath, new OrtSession.SessionOptions()); // some ONNX functionality that loads our onnx file so we can feed it in images
-                IJ.log("ONNX model loaded successfully.");
-            } catch (OrtException e) {
-                IJ.handleException(e);
-                return DONE;
-            }
+
+        // Initialize the ONNX environment once.
+        // No try-catch is needed here as getEnvironment() does not throw a checked OrtException.
+        if (env == null) {
+            env = OrtEnvironment.getEnvironment();
         }
+        
         return DOES_ALL;
     }
-
+    
     @Override
     public void run(ImageProcessor ip) {
+        // --- 1. Create the Dialog Window ---
+        GenericDialog gd = new GenericDialog("Select Analysis Type");
+        String[] choices = {"Electron/Positron", "Gamma Ray"};
+        gd.addChoice("Analysis Workflow:", choices, choices[0]); // Adds a dropdown menu
+
+        // --- 2. Show the Dialog and Wait for User Input ---
+        gd.showDialog();
+
+        // Exit the plugin if the user clicks "Cancel"
+        if (gd.wasCanceled()) {
+            return;
+        }
+
+        // --- 3. Get the User's Choice and Run the Correct Workflow ---
+        String userChoice = gd.getNextChoice();
+
         try {
-            // == 1. PRE-PROCESSING AND INFERENCE ==
-            int originalWidth = ip.getWidth();
-            int originalHeight = ip.getHeight();
-            float[] inputData = preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT); //run data through preprocessing function that gets the data into a format yolo model can correctly read
-            OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH}); //ONNX method that takes in our image data (formatted as an array of floats) and converts it into a tensor object that yolo can take as input
-            String inputName = session.getInputNames().iterator().next();
-            OrtSession.Result results = session.run(Collections.singletonMap(inputName, inputTensor));
-            float[][][] outputData = (float[][][]) results.get(0).getValue(); // yolo model outputs a 4d array, we're only interested in the first component (.get(0)), leaving us with a 3d array
-            float[][] transposedData = transpose(outputData[0]); // our 3d array still has a batch dimension (looks like (1, x, y)), so we do data[0] to get rid of the batch dimension. then we transpose so the rows represent detections
-
-            // == 2. FILTER DETECTIONS TO GET BEST FOR EACH CLASS ==
-            Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();
-            /*
-             * J-COMMENT: 'Map<Integer, Detection>' is a dictionary-like data structure.
-             * It maps a key (the class ID, an 'Integer') to a value (the 'Detection' object).
-             * 'new HashMap<>()' creates a new, empty map.
-             */
-
-            float confidenceThreshold = 0.25f;
-            for (float[] detectionData : transposedData) { //assumes that transposedData is composed of an array of arrays, where each row stores info about a single detection. We iterate over every row to iterate over all detections
-                float[] classScores = new float[detectionData.length - 4];
-                System.arraycopy(detectionData, 4, classScores, 0, classScores.length);
-                int bestClassId = -1;
-                float maxScore = 0.0f;
-                for (int i = 0; i < classScores.length; i++) { 
-                    if (classScores[i] > maxScore) {
-                        maxScore = classScores[i];
-                        bestClassId = i;
-                    }
-                }
-                if (maxScore > confidenceThreshold) {
-                    float[] box = {detectionData[0], detectionData[1], detectionData[2], detectionData[3]};
-                    Detection currentDetection = new Detection(bestClassId, maxScore, box);
-                    if (!bestDetectionsPerClass.containsKey(bestClassId) || maxScore > bestDetectionsPerClass.get(bestClassId).confidence) {
-                        bestDetectionsPerClass.put(bestClassId, currentDetection);
-                    }
-                }
+            if (userChoice.equals("Electron/Positron")) {
+                IJ.log("--- Running Electron/Positron Workflow ---");
+                runElectronPositronWorkflow(ip);
+            } else if (userChoice.equals("Gamma Ray")) {
+                IJ.log("--- Running Gamma Ray Workflow ---");
+                runGammaWorkflow(ip);
             }
-
-            // == 3. CREATE SIGNAL AND BACKGROUND ROIs ==
-            String[] classNames = {"electron", "positron"};
-            List<Roi> signalRois = new ArrayList<>(); //empty list to store detected rois
-            List<Roi> analysisRois = new ArrayList<>(); // empty list to store rois for analysis (we add 2 pixels of padding on each side for interpolation)
-
-            // Use a sorted list to ensure consistent ordering (e.g., electron then positron), sorting by class ID.
-            List<Detection> sortedDetections = new ArrayList<>(bestDetectionsPerClass.values());
-            Collections.sort(sortedDetections, (d1, d2) -> Integer.compare(d1.classId, d2.classId));
-
-            for (Detection detection : sortedDetections) {
-                float scale = Math.min((float) MODEL_WIDTH / originalWidth, (float) MODEL_HEIGHT / originalHeight); //scale is used to rescale xy positions from the output of the yolo model to positions on imagej image
-                int padX = (MODEL_WIDTH - Math.round(originalWidth * scale)) / 2; //calculate padding made before feeding in image to undo the preprocessing done on the image
-                int padY = (MODEL_HEIGHT - Math.round(originalHeight * scale)) / 2;
-                
-                float[] box = detection.box;
-                float centerX = box[0];
-                float centerY = box[1];
-                float width = box[2];
-                float height = box[3];
-
-                float unpaddedX = centerX - padX;
-                float unpaddedY = centerY - padY;
-
-                int x = Math.round(unpaddedX / scale);
-                int y = Math.round(unpaddedY / scale);
-                int w = Math.round(width / scale);
-                int h = Math.round(height / scale);
-                int x1 = x - (w / 2);
-                int y1 = y - (h / 2);
-
-                // Create and name the signal ROI
-                Roi signalRoi = new Roi(x1, y1, w, h);
-                String label = (detection.classId < classNames.length) ? classNames[detection.classId] : "Unknown";
-
-                signalRoi.setName(String.format("%s: %.2f", label, detection.confidence));
-                signalRois.add(signalRoi);
-
-                // Create a slightly wider ROI for analysis (2 pixels padding on each side)
-                int padding = 10;
-                int w_analysis = w + (padding * 2);
-                int x1_analysis = x1 - padding;
-                analysisRois.add(new Roi(x1_analysis, y1, w_analysis, h));
-            }
-
-            // Add signal ROIs to the manager and display them
-            RoiManager rm = RoiManager.getInstance2();
-            if (rm == null) rm = new RoiManager();
-            rm.reset();
-            for(Roi roi : signalRois) {
-                rm.addRoi(roi);
-            }
-            rm.setVisible(true);
-
-            // == 4. CALCULATE AND SHOW THE E/P RATIO ==
-            calculateAndShowEPRatio(this.image, signalRois, analysisRois);
-
-            rotateAndPlotSignals(this.image, signalRois);
-
-            // == 5. CLEAN UP RESOURCES ==
-            inputTensor.close();
-            results.close();
-
         } catch (Exception e) {
             IJ.handleException(e);
         }
     }
 
+    
+
+/**
+ * Manages the entire workflow for Electron/Positron (MS) images.
+ */
+    private void runElectronPositronWorkflow(ImageProcessor ip) throws OrtException {
+        // Lazy-load the E/P model only when needed
+        if (epSession == null) {
+            epSession = env.createSession(EP_MODEL_PATH, new OrtSession.SessionOptions());
+            IJ.log("Electron/Positron ONNX model loaded successfully.");
+        }
+
+        // Use a "try-with-resources" block to ensure the tensor is always closed
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT)), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH})) {
+            
+            // CORRECTED: Use epSession here
+            String inputName = epSession.getInputNames().iterator().next();
+
+            // The "results" object is also managed by the try-with-resources block
+            try (OrtSession.Result results = epSession.run(Collections.singletonMap(inputName, inputTensor))) {
+
+                // == 1. PROCESS RESULTS ==
+                float[][][] outputData = (float[][][]) results.get(0).getValue();
+                float[][] transposedData = transpose(outputData[0]);
+
+                // == 2. FILTER DETECTIONS TO GET BEST FOR EACH CLASS ==
+                Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();
+                float confidenceThreshold = 0.25f;
+                for (float[] detectionData : transposedData) {
+                    float[] classScores = new float[detectionData.length - 4];
+                    System.arraycopy(detectionData, 4, classScores, 0, classScores.length);
+                    int bestClassId = -1;
+                    float maxScore = 0.0f;
+                    for (int i = 0; i < classScores.length; i++) {
+                        if (classScores[i] > maxScore) {
+                            maxScore = classScores[i];
+                            bestClassId = i;
+                        }
+                    }
+                    if (maxScore > confidenceThreshold) {
+                        float[] box = {detectionData[0], detectionData[1], detectionData[2], detectionData[3]};
+                        Detection currentDetection = new Detection(bestClassId, maxScore, box);
+                        if (!bestDetectionsPerClass.containsKey(bestClassId) || maxScore > bestDetectionsPerClass.get(bestClassId).confidence) {
+                            bestDetectionsPerClass.put(bestClassId, currentDetection);
+                        }
+                    }
+                }
+                
+                // If no valid detections were found, exit early.
+                if (bestDetectionsPerClass.isEmpty()) {
+                    IJ.log("No electron or positron signals detected above the confidence threshold.");
+                    return;
+                }
+
+                // == 3. CREATE SIGNAL AND BACKGROUND ROIs ==
+                String[] classNames = {"electron", "positron"};
+                List<Roi> signalRois = new ArrayList<>();
+                List<Roi> analysisRois = new ArrayList<>();
+                
+                int originalWidth = ip.getWidth();
+                int originalHeight = ip.getHeight();
+
+                List<Detection> sortedDetections = new ArrayList<>(bestDetectionsPerClass.values());
+                Collections.sort(sortedDetections, (d1, d2) -> Integer.compare(d1.classId, d2.classId));
+
+                for (Detection detection : sortedDetections) {
+                    float scale = Math.min((float) MODEL_WIDTH / originalWidth, (float) MODEL_HEIGHT / originalHeight);
+                    int padX = (MODEL_WIDTH - Math.round(originalWidth * scale)) / 2;
+                    int padY = (MODEL_HEIGHT - Math.round(originalHeight * scale)) / 2;
+                    
+                    float[] box = detection.box;
+                    float centerX = box[0]; float centerY = box[1]; float width = box[2]; float height = box[3];
+                    float unpaddedX = centerX - padX; float unpaddedY = centerY - padY;
+                    int x = Math.round(unpaddedX / scale); int y = Math.round(unpaddedY / scale);
+                    int w = Math.round(width / scale); int h = Math.round(height / scale);
+                    int x1 = x - (w / 2); int y1 = y - (h / 2);
+
+                    Roi signalRoi = new Roi(x1, y1, w, h);
+                    String label = (detection.classId < classNames.length) ? classNames[detection.classId] : "Unknown";
+                    signalRoi.setName(String.format("%s: %.2f", label, detection.confidence));
+                    signalRois.add(signalRoi);
+
+                    int padding = 10;
+                    analysisRois.add(new Roi(x1 - padding, y1, w + (padding * 2), h));
+                }
+
+                // == 4. PERFORM ANALYSIS AND PLOTTING ==
+                calculateAndShowEPRatio(this.image, signalRois, analysisRois);
+                rotateAndPlotSignals(this.image, signalRois);
+            }
+        // The try-with-resources statement automatically closes the tensor and results here
+        }
+    }
+
+    private void runGammaWorkflow(ImageProcessor ip) throws OrtException {
+        if (gammaSession == null) {
+            gammaSession = env.createSession(GAMMA_MODEL_PATH, new OrtSession.SessionOptions());
+            IJ.log("Gamma Ray ONNX model loaded successfully.");
+        }
+
+        // CORRECTED: Use try-with-resources for the input tensor
+        try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(preprocessImage(ip, MODEL_WIDTH, MODEL_HEIGHT)), new long[]{1, 3, MODEL_HEIGHT, MODEL_WIDTH})) {
+            
+            String inputName = gammaSession.getInputNames().iterator().next();
+            
+            try (OrtSession.Result results = gammaSession.run(Collections.singletonMap(inputName, inputTensor))) {
+                
+                // == 1. FILTER DETECTIONS (This logic was correct) ==
+                float[][][] outputData = (float[][][]) results.get(0).getValue();
+                float[][] transposedData = transpose(outputData[0]);
+                Map<Integer, Detection> bestDetectionsPerClass = new HashMap<>();
+                // ... (The filtering logic for bestDetectionsPerClass is fine) ...
+                float confidenceThreshold = 0.25f;
+                for (float[] detectionData : transposedData) {
+                    float[] classScores = new float[detectionData.length - 4];
+                    System.arraycopy(detectionData, 4, classScores, 0, classScores.length);
+                    int bestClassId = -1;
+                    float maxScore = 0.0f;
+                    for (int i = 0; i < classScores.length; i++) {
+                        if (classScores[i] > maxScore) {
+                            maxScore = classScores[i];
+                            bestClassId = i;
+                        }
+                    }
+                    if (maxScore > confidenceThreshold) {
+                        float[] box = {detectionData[0], detectionData[1], detectionData[2], detectionData[3]};
+                        Detection currentDetection = new Detection(bestClassId, maxScore, box);
+                        if (!bestDetectionsPerClass.containsKey(bestClassId) || maxScore > bestDetectionsPerClass.get(bestClassId).confidence) {
+                            bestDetectionsPerClass.put(bestClassId, currentDetection);
+                        }
+                    }
+                }
+                
+                // If no valid detections were found, exit early.
+                if (bestDetectionsPerClass.isEmpty()) {
+                    IJ.log("No gamma ray signals detected above the confidence threshold.");
+                    return;
+                }
+                
+
+                // == 2. CREATE ROIs FROM DETECTIONS (This part was missing) ==
+                List<Roi> signalRois = new ArrayList<>();
+                List<Roi> analysisRois = new ArrayList<>();
+                String[] classNames = {"gamma"};
+                int originalWidth = ip.getWidth();
+                int originalHeight = ip.getHeight();
+
+                for (Detection detection : bestDetectionsPerClass.values()) {
+                    // This is the essential logic to convert detection coordinates to ROI coordinates
+                    float scale = Math.min((float) MODEL_WIDTH / originalWidth, (float) MODEL_HEIGHT / originalHeight);
+                    int padX = (MODEL_WIDTH - Math.round(originalWidth * scale)) / 2;
+                    int padY = (MODEL_HEIGHT - Math.round(originalHeight * scale)) / 2;
+                    float[] box = detection.box;
+                    float unpaddedX = box[0] - padX; float unpaddedY = box[1] - padY;
+                    int x = Math.round(unpaddedX / scale); int y = Math.round(unpaddedY / scale);
+                    int w = Math.round(box[2] / scale); int h = Math.round(box[3] / scale);
+                    int x1 = x - (w / 2); int y1 = y - (h / 2);
+
+                    Roi signalRoi = new Roi(x1, y1, w, h);
+                    String label = (detection.classId < classNames.length) ? classNames[detection.classId] : "Unknown";
+                    signalRoi.setName(String.format("%s: %.2f", label, detection.confidence));
+                    signalRois.add(signalRoi);
+
+                    int padding = 10;
+                    analysisRois.add(new Roi(x1 - padding, y1, w + (padding * 2), h));
+                }
+
+                // == 3. DISPLAY ROIs AND ANALYZE ==
+                Overlay gammaOverlay = new Overlay();
+                for(Roi roi : signalRois) {
+                    roi.setStrokeColor(java.awt.Color.GREEN);
+                    gammaOverlay.add(roi);
+                }
+                this.image.setOverlay(gammaOverlay);
+
+                IJ.log("Found " + signalRois.size() + " gamma signal(s). Generating plots...");
+                for (int i = 0; i < signalRois.size(); i++) {
+                    FitResult result = calculateSignalWithPolynomialFit(this.image, signalRois.get(i), analysisRois.get(i));
+                    if (result != null) {
+                        Plot subtractedPlot = new Plot("Subtracted Profile: " + signalRois.get(i).getName(), "Distance (pixels)", "Subtracted Intensity");
+                        subtractedPlot.add("line", result.subtractedProfile);
+                        subtractedPlot.show();
+                }
+            }
+        }
+    }
+/**
+ * Reusable method to generate a raw plot and a background-subtracted plot for a given ROI.
+ */
     /**
      * Performs background subtraction using a polynomial fit and calculates the E/P ratio.
      */
 // --- This is the fully updated 'calculateAndShowEPRatio' method ---
 
     private void calculateAndShowEPRatio(ImagePlus imp, List<Roi> signalRois, List<Roi> analysisRois) {
-        if (signalRois.size() < 2) {
-            IJ.log("Error: Expected at least 2 detections to calculate ratio.");
-            return;
-        }
-
-        // Use maps to store results by class name for robust calculation
         Map<String, Double> summedSignals = new HashMap<>();
-        Map<String, Double> rSquaredValues = new HashMap<>(); // Map to store R^2 values
+        Map<String, Double> rSquaredValues = new HashMap<>();
 
         for (int i = 0; i < signalRois.size(); i++) {
             Roi signalRoi = signalRois.get(i);
             Roi analysisRoi = analysisRois.get(i);
             String roiName = signalRoi.getName().split(":")[0].trim();
 
-            imp.setRoi(analysisRoi);
-            double[] analysisProfile = new ProfilePlot(imp).getProfile();
+            // Call the new helper method
+            FitResult result = calculateSignalWithPolynomialFit(imp, signalRoi, analysisRoi);
             
-            if (analysisProfile == null || analysisProfile.length < 5) { // Need at least 5 pts for a decent fit
-                IJ.log("Could not generate a valid profile for " + roiName + ". Skipping.");
-                continue;
+            if (result != null) {
+                summedSignals.put(roiName, result.summedSignal);
+                rSquaredValues.put(roiName, result.rSquared);
             }
-
-            // --- 1. GATHER A LARGER SET OF BACKGROUND POINTS ---
-            List<WeightedObservedPoint> observations = new ArrayList<>();
-            int signalWidth = signalRoi.getBounds().width;
-            // Determine how many pixels of padding are on each side
-            int paddingWidth = (analysisProfile.length - signalWidth) / 2;
-
-            // Add points from the left-side background padding
-            for (int j = 0; j < paddingWidth; j++) {
-                observations.add(new WeightedObservedPoint(1.0, j, analysisProfile[j]));
-            }
-            // Add points from the right-side background padding
-            for (int j = 0; j < paddingWidth; j++) {
-                int x_pos = signalWidth + paddingWidth + j;
-                if (x_pos < analysisProfile.length) { // Boundary check
-                    observations.add(new WeightedObservedPoint(1.0, x_pos, analysisProfile[x_pos]));
-                }
-            }
-            
-            if (observations.size() <= 2) {
-                IJ.log("Not enough background points to fit polynomial for " + roiName);
-                continue;
-            }
-
-            // --- 2. FIT THE POLYNOMIAL TO THE BACKGROUND POINTS ---
-            // You can change the degree here (e.g., 1 for linear, 2 for quadratic)
-            int polynomialDegree = 2; 
-            PolynomialCurveFitter fitter = PolynomialCurveFitter.create(polynomialDegree);
-            double[] coefficients = fitter.fit(observations);
-            PolynomialFunction polynomial = new PolynomialFunction(coefficients);
-
-            // --- 3. CALCULATE THE R-SQUARED VALUE FOR THE FIT ---
-            double sumOfSquaresTotal = 0;
-            double sumOfSquaresResidual = 0;
-            double meanY = 0;
-            for (WeightedObservedPoint p : observations) {
-                meanY += p.getY();
-            }
-            meanY /= observations.size();
-
-            for (WeightedObservedPoint p : observations) {
-                double predictedY = polynomial.value(p.getX());
-                sumOfSquaresTotal += Math.pow(p.getY() - meanY, 2);
-                sumOfSquaresResidual += Math.pow(p.getY() - predictedY, 2);
-            }
-
-            double rSquared = (sumOfSquaresTotal > 0) ? (1.0 - (sumOfSquaresResidual / sumOfSquaresTotal)) : 1.0;
-            rSquaredValues.put(roiName, rSquared);
-
-
-            // --- 4. SUBTRACT BACKGROUND AND SUM THE SIGNAL ---
-            double sumOfSubtractedSignal = 0;
-            int signalStartInAnalysis = paddingWidth;
-            for (int j = 0; j < signalWidth; j++) {
-                int x_pos = j + signalStartInAnalysis;
-                double signalValue = analysisProfile[x_pos];
-                double backgroundValue = polynomial.value(x_pos); // Use the new polynomial fit
-                double subtractedValue = signalValue - backgroundValue;
-                sumOfSubtractedSignal += subtractedValue;
-            }
-            summedSignals.put(roiName, sumOfSubtractedSignal);
         }
-
-        imp.killRoi();
+            imp.killRoi();
 
         // --- 5. CALCULATE AND DISPLAY THE E/P RATIO AND R^2 VALUES ---
         if (summedSignals.containsKey("electron") && summedSignals.containsKey("positron")) {
@@ -447,5 +496,86 @@ public class YOLO_Detector implements PlugInFilter {
             }
         }
         return transposed;
+    }
+
+        /**
+     * Performs a polynomial background fit and calculates the summed signal, R^2 value,
+     * and the subtracted profile data.
+     * @param imp The ImagePlus to analyze.
+     * @param signalRoi The ROI defining the signal region.
+     * @param analysisRoi The wider ROI containing signal and background padding.
+     * @return A FitResult object containing the calculated values, or null if an error occurs.
+     */
+    private FitResult calculateSignalWithPolynomialFit(ImagePlus imp, Roi signalRoi, Roi analysisRoi) {
+        imp.setRoi(analysisRoi);
+        double[] analysisProfile = new ProfilePlot(imp).getProfile();
+        
+        if (analysisProfile == null || analysisProfile.length < 5) {
+            IJ.log("Could not generate a valid profile. Skipping.");
+            return null;
+        }
+
+        // --- 1. GATHER BACKGROUND POINTS ---
+        List<WeightedObservedPoint> observations = new ArrayList<>();
+        int signalWidth = signalRoi.getBounds().width;
+        int paddingWidth = (analysisProfile.length - signalWidth) / 2;
+        for (int j = 0; j < paddingWidth; j++) {
+            observations.add(new WeightedObservedPoint(1.0, j, analysisProfile[j]));
+            int x_pos = signalWidth + paddingWidth + j;
+            if (x_pos < analysisProfile.length) {
+                observations.add(new WeightedObservedPoint(1.0, x_pos, analysisProfile[x_pos]));
+            }
+        }
+        
+        if (observations.size() <= 2) {
+            IJ.log("Not enough background points to fit polynomial.");
+            return null;
+        }
+
+        // --- 2. FIT THE POLYNOMIAL (Linear fit is often safest) ---
+        PolynomialCurveFitter fitter = PolynomialCurveFitter.create(1); // Using degree 1 (linear)
+        double[] coefficients = fitter.fit(observations);
+        PolynomialFunction polynomial = new PolynomialFunction(coefficients);
+
+        // --- 3. CALCULATE R-SQUARED ---
+        double sumOfSquaresTotal = 0, sumOfSquaresResidual = 0, meanY = 0;
+        for (WeightedObservedPoint p : observations) { meanY += p.getY(); }
+        meanY /= observations.size();
+        for (WeightedObservedPoint p : observations) {
+            double predictedY = polynomial.value(p.getX());
+            sumOfSquaresTotal += Math.pow(p.getY() - meanY, 2);
+            sumOfSquaresResidual += Math.pow(p.getY() - predictedY, 2);
+        }
+        double rSquared = (sumOfSquaresTotal > 0) ? (1.0 - (sumOfSquaresResidual / sumOfSquaresTotal)) : 1.0;
+
+        // --- 4. CALCULATE SUBTRACTED SIGNAL AND PROFILE ---
+        double sumOfSubtractedSignal = 0;
+        double[] subtractedProfile = new double[signalWidth];
+        int signalStartInAnalysis = paddingWidth;
+        for (int j = 0; j < signalWidth; j++) {
+            int x_pos = j + signalStartInAnalysis;
+            double signalValue = analysisProfile[x_pos];
+            double backgroundValue = polynomial.value(x_pos);
+            double subtractedValue = signalValue - backgroundValue;
+            sumOfSubtractedSignal += subtractedValue;
+            subtractedProfile[j] = subtractedValue;
+        }
+
+        return new FitResult(sumOfSubtractedSignal, rSquared, subtractedProfile);
+    }
+
+    /**
+ * A small helper class to hold the results from a polynomial fit calculation.
+ */
+    private static class FitResult {
+        final double summedSignal;
+        final double rSquared;
+        final double[] subtractedProfile;
+
+        FitResult(double summedSignal, double rSquared, double[] subtractedProfile) {
+            this.summedSignal = summedSignal;
+            this.rSquared = rSquared;
+            this.subtractedProfile = subtractedProfile;
+        }
     }
 }
